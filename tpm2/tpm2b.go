@@ -73,11 +73,20 @@ func (value TPM2B[T, P]) marshal(buf *bytes.Buffer) {
 
 // unmarshal implements the tpm2.Unmarshallable interface.
 // Note: the structure contents are not validated during unmarshalling.
+//
+// If the input is truncated, the receiver is reset to its zero value so that a
+// failed decode never leaves behind a partially populated TPM2B.
 func (value *TPM2B[T, P]) unmarshal(buf *bytes.Buffer) error {
 	var size uint16
-	binary.Read(buf, binary.BigEndian, &size)
+	if err := binary.Read(buf, binary.BigEndian, &size); err != nil {
+		*value = TPM2B[T, P]{}
+		return err
+	}
 	value.contents = nil
 	value.buffer = make([]byte, size)
-	_, err := io.ReadAtLeast(buf, value.buffer, int(size))
-	return err
+	if _, err := io.ReadAtLeast(buf, value.buffer, int(size)); err != nil {
+		*value = TPM2B[T, P]{}
+		return err
+	}
+	return nil
 }

@@ -523,7 +523,10 @@ func unmarshalStructField(buf *bytes.Buffer, v reflect.Value, i int) error {
 	bufToReadFrom := buf
 	if sized {
 		var expectedSize uint16
-		binary.Read(buf, binary.BigEndian, &expectedSize)
+		if err := binary.Read(buf, binary.BigEndian, &expectedSize); err != nil {
+			return fmt.Errorf("reading size of sized parameter '%v' inside struct of type '%v': %w",
+				fieldType.Name, v.Type().Name(), err)
+		}
 		sizedBufArray := make([]byte, int(expectedSize))
 		n, err := buf.Read(sizedBufArray)
 		if n != int(expectedSize) {
@@ -538,7 +541,10 @@ func unmarshalStructField(buf *bytes.Buffer, v reflect.Value, i int) error {
 	}
 	if sized8 {
 		var expectedSize uint8
-		binary.Read(buf, binary.BigEndian, &expectedSize)
+		if err := binary.Read(buf, binary.BigEndian, &expectedSize); err != nil {
+			return fmt.Errorf("reading size of sized parameter '%v' inside struct of type '%v': %w",
+				fieldType.Name, v.Type().Name(), err)
+		}
 		sizedBufArray := make([]byte, int(expectedSize))
 		n, err := buf.Read(sizedBufArray)
 		if n != int(expectedSize) {
@@ -1271,18 +1277,20 @@ func rspParameters(parms []byte, sess []Session, rspStruct any) error {
 	// decryption.
 	// If the command supports parameter encryption, the first parameter is
 	// a 2B.
-	if len(parms) < 2 {
-		return nil
-	}
-	length := binary.BigEndian.Uint16(parms[0:])
-	// TODO: Make this nice using structure tagging.
-	if int(length)+2 <= len(parms) {
-		for i, s := range sess {
-			if !s.IsEncryption() {
-				continue
-			}
-			if err := s.Decrypt(parms[2 : 2+length]); err != nil {
-				return fmt.Errorf("decrypting first parameter with session %d: %w", i, err)
+	// A short parameter area is not itself an error here: the loop below
+	// still has to run so that missing required fields are reported. A
+	// response struct with no parameters simply decodes the empty area.
+	if len(parms) >= 2 {
+		length := binary.BigEndian.Uint16(parms[0:])
+		// TODO: Make this nice using structure tagging.
+		if int(length)+2 <= len(parms) {
+			for i, s := range sess {
+				if !s.IsEncryption() {
+					continue
+				}
+				if err := s.Decrypt(parms[2 : 2+length]); err != nil {
+					return fmt.Errorf("decrypting first parameter with session %d: %w", i, err)
+				}
 			}
 		}
 	}
@@ -1290,6 +1298,10 @@ func rspParameters(parms []byte, sess []Session, rspStruct any) error {
 	for i := numHandles; i < reflect.TypeOf(rspStruct).Elem().NumField(); i++ {
 		parmsField := reflect.ValueOf(rspStruct).Elem().Field(i)
 		if parmsField.Kind() == reflect.Ptr && hasTag(reflect.TypeOf(rspStruct).Elem().Field(i), "optional") {
+			if buf.Len() < 2 {
+				return fmt.Errorf("ran out of data reading optional parameter '%v' inside struct of type '%v'",
+					reflect.TypeOf(rspStruct).Elem().Field(i).Name, reflect.TypeOf(rspStruct).Elem().Name())
+			}
 			if binary.BigEndian.Uint16(buf.Bytes()) == 0 {
 				// Advance the buffer past the zero size and skip to the
 				// next field of the struct.

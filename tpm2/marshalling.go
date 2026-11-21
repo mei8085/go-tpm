@@ -184,7 +184,18 @@ func MarshalCommand[C Command[R, *R], R any](cmd C) ([]byte, error) {
 //   - command produced from this function is not meant to be executed directly on a TPM,
 //     instead it is expected to be used for purposes such as auditing or inspection.
 //   - encrypted command parameters (via sessions) are not currently supported.
+//   - on error the returned command is the zero value; partially unmarshalled
+//     state is never exposed to the caller.
 func UnmarshalCommand[C Command[R, *R], R any](data []byte) (C, error) {
+	cmd, err := unmarshalCommand[C, R](data)
+	if err != nil {
+		var zero C
+		return zero, err
+	}
+	return cmd, nil
+}
+
+func unmarshalCommand[C Command[R, *R], R any](data []byte) (C, error) {
 	var cmd C
 
 	if data == nil {
