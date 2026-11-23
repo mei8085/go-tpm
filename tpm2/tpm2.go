@@ -4,6 +4,7 @@ package tpm2
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/google/go-tpm/tpm2/transport"
 )
@@ -1601,6 +1602,422 @@ func (cmd PolicyAuthorizeNV) Update(policy *PolicyCalculator) error {
 
 // PolicyAuthorizeNVResponse is the response from TPM2_PolicyAuthorizeNV.
 type PolicyAuthorizeNVResponse struct{}
+
+// PolicyLocality is the input to TPM2_PolicyLocality.
+// See definition in Part 3, Commands, section 23.8.
+//
+// The command restricts the localities at which a policy-authorized command may
+// be executed. A regular (0--4) locality that was previously set is
+// intersected with the new one; an extended locality (>= 32) has to be equal to
+// any previously set extended locality. Because the TPM carries the
+// accumulated locality in the session and not in the policy digest, the policy
+// digest only commits to each locality value that was passed in.
+type PolicyLocality struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+	// the allowed localities for the policy
+	Locality TPMALocality
+}
+
+// Command implements the Command interface.
+func (PolicyLocality) Command() TPMCC { return TPMCCPolicyLocality }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyLocality) Execute(t transport.TPM, s ...Session) (*PolicyLocalityResponse, error) {
+	var rsp PolicyLocalityResponse
+	err := execute[PolicyLocalityResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+func (cmd PolicyLocality) Update(policy *PolicyCalculator) error {
+	if err := validatePolicyLocality(cmd.Locality); err != nil {
+		return err
+	}
+	return policy.Update(TPMCCPolicyLocality, cmd.Locality)
+}
+
+// PolicyLocalityResponse is the response from TPM2_PolicyLocality.
+type PolicyLocalityResponse struct{}
+
+// validatePolicyLocality enforces the input constraint of TPM2_PolicyLocality
+// that can be checked without a session: the locality must not be empty, i.e.,
+// at least one of the bits of the TPMA_LOCALITY byte has to be set. A byte below
+// 32 denotes a regular locality and a byte of at least 32 denotes an extended
+// locality (Part 2, section 8.5), so every non-empty value is representable.
+func validatePolicyLocality(l TPMALocality) error {
+	if !l.TPMLocZero && !l.TPMLocOne && !l.TPMLocTwo && !l.TPMLocThree && !l.TPMLocFour && l.Extended == 0 {
+		return fmt.Errorf("locality must not be empty")
+	}
+	return nil
+}
+
+// PolicyNameHash is the input to TPM2_PolicyNameHash.
+// See definition in Part 3, Commands, section 23.14.
+type PolicyNameHash struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+	// the digest of the name of the object to be checked
+	NameHash TPM2BDigest
+}
+
+// Command implements the Command interface.
+func (PolicyNameHash) Command() TPMCC { return TPMCCPolicyNameHash }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyNameHash) Execute(t transport.TPM, s ...Session) (*PolicyNameHashResponse, error) {
+	var rsp PolicyNameHashResponse
+	err := execute[PolicyNameHashResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+//
+// The TPM rejects a nameHash whose size is not the digest size of the session's
+// hash algorithm (TPM_RC_SIZE, even for a trial session) and one that would
+// conflict with a cpHash, template or bound entity already recorded in the
+// session. The calculator is stateless, so only the size can be enforced here.
+func (cmd PolicyNameHash) Update(policy *PolicyCalculator) error {
+	if err := checkPolicyDigestSize(policy, "nameHash", cmd.NameHash.Buffer); err != nil {
+		return err
+	}
+	return policy.Update(TPMCCPolicyNameHash, cmd.NameHash.Buffer)
+}
+
+// PolicyNameHashResponse is the response from TPM2_PolicyNameHash.
+type PolicyNameHashResponse struct{}
+
+// PolicyTicket is the input to TPM2_PolicyTicket.
+// See definition in Part 3, Commands, section 23.5.
+//
+// PolicyTicket substitutes a ticket previously produced by TPM2_PolicySigned or
+// TPM2_PolicySecret for the corresponding authorization. The ticket tag
+// determines which of the two commands the policy digest is extended with.
+type PolicyTicket struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+	// the timeout value used to generate the ticket
+	Timeout TPM2BTimeout
+	// digest of the command parameters to which this authorization is limited
+	CPHashA TPM2BDigest
+	// a reference to a policy relating to the authorization
+	PolicyRef TPM2BNonce
+	// Name of the object that provided the authorization
+	AuthName TPM2BName
+	// the ticket to be evaluated
+	Ticket TPMTTKAuth
+}
+
+// Command implements the Command interface.
+func (PolicyTicket) Command() TPMCC { return TPMCCPolicyTicket }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyTicket) Execute(t transport.TPM, s ...Session) (*PolicyTicketResponse, error) {
+	var rsp PolicyTicketResponse
+	err := execute[PolicyTicketResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+//
+// The digest is extended exactly as TPM2_PolicySigned or TPM2_PolicySecret
+// would have extended it (the TPM uses the ticket tag to select the command
+// code), so a policy computed with PolicyTicket is interchangeable with one
+// computed from the corresponding authorization.
+func (cmd PolicyTicket) Update(policy *PolicyCalculator) error {
+	var cc TPMCC
+	switch cmd.Ticket.Tag {
+	case TPMSTAuthSigned:
+		cc = TPMCCPolicySigned
+	case TPMSTAuthSecret:
+		cc = TPMCCPolicySecret
+	default:
+		return fmt.Errorf("policy ticket tag %#04x is neither TPM_ST_AUTH_SIGNED nor TPM_ST_AUTH_SECRET", uint16(cmd.Ticket.Tag))
+	}
+	return policyUpdate(policy, cc, cmd.AuthName.Buffer, cmd.PolicyRef.Buffer)
+}
+
+// PolicyTicketResponse is the response from TPM2_PolicyTicket.
+type PolicyTicketResponse struct{}
+
+// PolicyCounterTimer is the input to TPM2_PolicyCounterTimer.
+// See definition in Part 3, Commands, section 23.10.
+//
+// The command gates a policy on a comparison between a portion of the
+// authorization session's TPMS_TIME_INFO and OperandB.
+type PolicyCounterTimer struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+	// the second operand
+	OperandB TPM2BOperand
+	// the octet offset into the TPMS_TIME_INFO structure for the start of operand A
+	Offset uint16
+	// the comparison to make
+	Operation TPMEO
+}
+
+// Command implements the Command interface.
+func (PolicyCounterTimer) Command() TPMCC { return TPMCCPolicyCounterTimer }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyCounterTimer) Execute(t transport.TPM, s ...Session) (*PolicyCounterTimerResponse, error) {
+	var rsp PolicyCounterTimerResponse
+	err := execute[PolicyCounterTimerResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// tpmTimeInfoSize is the size of the canonical encoding of TPMS_TIME_INFO:
+// time (uint64), clockInfo.clock (uint64), clockInfo.resetCount (uint32),
+// clockInfo.restartCount (uint32) and clockInfo.safe (uint8).
+const tpmTimeInfoSize = 8 + 8 + 4 + 4 + 1
+
+// Update implements the PolicyCommand interface.
+//
+// The operand and comparison are hashed, not the current time: the policy only
+// commits to what should be compared, and the actual comparison is made by the
+// TPM when the policy is executed. Inputs that the TPM rejects even for a trial
+// session (an out-of-bounds operand or an unknown comparison) are rejected here
+// rather than producing a digest the TPM would never compute.
+func (cmd PolicyCounterTimer) Update(policy *PolicyCalculator) error {
+	// The TPM checks that the referenced bytes lie within TPMS_TIME_INFO
+	// even for a trial session; an offset equal to the structure size with
+	// an empty operand is allowed.
+	if int(cmd.Offset)+len(cmd.OperandB.Buffer) > tpmTimeInfoSize {
+		return fmt.Errorf("operand B at offset %d with size %d exceeds the %d-byte TPMS_TIME_INFO",
+			cmd.Offset, len(cmd.OperandB.Buffer), tpmTimeInfoSize)
+	}
+	if !cmd.Operation.valid() {
+		return fmt.Errorf("invalid comparison operation %#04x", uint16(cmd.Operation))
+	}
+	alg, err := policy.alg.Hash()
+	if err != nil {
+		return err
+	}
+	h := alg.New()
+	h.Write(cmd.OperandB.Buffer)
+	binary.Write(h, binary.BigEndian, cmd.Offset)
+	binary.Write(h, binary.BigEndian, cmd.Operation)
+	args := h.Sum(nil)
+	return policy.Update(TPMCCPolicyCounterTimer, args)
+}
+
+// PolicyCounterTimerResponse is the response from TPM2_PolicyCounterTimer.
+type PolicyCounterTimerResponse struct{}
+
+// valid reports whether o is one of the TPM_EO values defined in Part 2,
+// section 6.8. The defined values are contiguous in the range 0--0x000B.
+func (o TPMEO) valid() bool {
+	return o >= TPMEOEq && o <= TPMEOBitClear
+}
+
+// PolicyTemplate is the input to TPM2_PolicyTemplate.
+// See definition in Part 3, Commands, section 23.21.
+type PolicyTemplate struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+	// the hash of the template for the object to be created
+	TemplateHash TPM2BDigest
+}
+
+// Command implements the Command interface.
+func (PolicyTemplate) Command() TPMCC { return TPMCCPolicyTemplate }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyTemplate) Execute(t transport.TPM, s ...Session) (*PolicyTemplateResponse, error) {
+	var rsp PolicyTemplateResponse
+	err := execute[PolicyTemplateResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+func (cmd PolicyTemplate) Update(policy *PolicyCalculator) error {
+	if err := checkPolicyDigestSize(policy, "templateHash", cmd.TemplateHash.Buffer); err != nil {
+		return err
+	}
+	return policy.Update(TPMCCPolicyTemplate, cmd.TemplateHash.Buffer)
+}
+
+// PolicyTemplateResponse is the response from TPM2_PolicyTemplate.
+type PolicyTemplateResponse struct{}
+
+// PolicyPassword is the input to TPM2_PolicyPassword.
+// See definition in Part 3, Commands, section 23.18.
+type PolicyPassword struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+}
+
+// Command implements the Command interface.
+func (PolicyPassword) Command() TPMCC { return TPMCCPolicyPassword }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyPassword) Execute(t transport.TPM, s ...Session) (*PolicyPasswordResponse, error) {
+	var rsp PolicyPasswordResponse
+	err := execute[PolicyPasswordResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+//
+// As specified in Part 3, section 23.18, the policy digest is extended with
+// TPM_CC_PolicyAuthValue rather than TPM_CC_PolicyPassword. The two commands
+// therefore produce the same digest: they differ only in the session attribute
+// that they set (a password rather than an HMAC may satisfy the policy).
+func (PolicyPassword) Update(policy *PolicyCalculator) error {
+	return policy.Update(TPMCCPolicyAuthValue)
+}
+
+// PolicyPasswordResponse is the response from TPM2_PolicyPassword.
+type PolicyPasswordResponse struct{}
+
+// PolicyPhysicalPresence is the input to TPM2_PolicyPhysicalPresence.
+// See definition in Part 3, Commands, section 23.12.
+type PolicyPhysicalPresence struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+}
+
+// Command implements the Command interface.
+func (PolicyPhysicalPresence) Command() TPMCC { return TPMCCPolicyPhysicalPresence }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyPhysicalPresence) Execute(t transport.TPM, s ...Session) (*PolicyPhysicalPresenceResponse, error) {
+	var rsp PolicyPhysicalPresenceResponse
+	err := execute[PolicyPhysicalPresenceResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+func (PolicyPhysicalPresence) Update(policy *PolicyCalculator) error {
+	return policy.Update(TPMCCPolicyPhysicalPresence)
+}
+
+// PolicyPhysicalPresenceResponse is the response from TPM2_PolicyPhysicalPresence.
+type PolicyPhysicalPresenceResponse struct{}
+
+// PolicyRestart is the input to TPM2_PolicyRestart.
+// See definition in Part 3, Commands, section 23.2.
+type PolicyRestart struct {
+	// handle for the policy session
+	PolicySession handle `gotpm:"handle"`
+}
+
+// Command implements the Command interface.
+func (PolicyRestart) Command() TPMCC { return TPMCCPolicyRestart }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyRestart) Execute(t transport.TPM, s ...Session) (*PolicyRestartResponse, error) {
+	var rsp PolicyRestartResponse
+	err := execute[PolicyRestartResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+//
+// Restarting a policy session discards all accumulated policy state, including
+// the policy digest, so the calculator is reset rather than extended. This is
+// the only policy command that does not chain a digest.
+func (PolicyRestart) Update(policy *PolicyCalculator) error {
+	policy.Reset()
+	return nil
+}
+
+// PolicyRestartResponse is the response from TPM2_PolicyRestart.
+type PolicyRestartResponse struct{}
+
+// PolicyACSendSelect is the input to TPM2_Policy_AC_SendSelect.
+// See definition in Part 3, Commands, section 23.23.
+//
+// The command binds a policy to an object, an authorized object and an attached
+// component, and is used to authorize TPM2_AC_Send.
+type PolicyACSendSelect struct {
+	// handle for the policy session being extended
+	PolicySession handle `gotpm:"handle"`
+	// Name of the object to be sent
+	ObjectName TPM2BName
+	// Name of the object that provides the authorization
+	AuthHandleName TPM2BName
+	// Name of the attached component
+	ACName TPM2BName
+	// YES if the object Name is to be included in the policy digest
+	IncludeObject TPMIYesNo
+}
+
+// Command implements the Command interface.
+func (PolicyACSendSelect) Command() TPMCC { return TPMCCPolicyACSendSelect }
+
+// Execute executes the command and returns the response.
+func (cmd PolicyACSendSelect) Execute(t transport.TPM, s ...Session) (*PolicyACSendSelectResponse, error) {
+	var rsp PolicyACSendSelectResponse
+	err := execute[PolicyACSendSelectResponse](t, cmd, &rsp, s...)
+	if err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Update implements the PolicyCommand interface.
+//
+// The session also records a hash of all four inputs in the cpHash slot so that
+// a subsequent TPM2_AC_Send can be checked against them; the policy digest
+// itself commits to the object Name only when IncludeObject is YES.
+func (cmd PolicyACSendSelect) Update(policy *PolicyCalculator) error {
+	parts := []interface{}{TPMCCPolicyACSendSelect}
+	if cmd.IncludeObject {
+		parts = append(parts, cmd.ObjectName.Buffer)
+	}
+	parts = append(parts, cmd.AuthHandleName.Buffer, cmd.ACName.Buffer, []byte{boolByte(cmd.IncludeObject)})
+	return policy.Update(parts...)
+}
+
+// boolByte returns the TPMI_YES_NO encoding of b: YES is 1, NO is 0.
+func boolByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// PolicyACSendSelectResponse is the response from TPM2_Policy_AC_SendSelect.
+type PolicyACSendSelectResponse struct{}
+
+// checkPolicyDigestSize verifies that a digest-sized input has the size of the
+// policy session's hash algorithm. The TPM performs this check even for a trial
+// session, for which the calculator is the equivalent.
+func checkPolicyDigestSize(policy *PolicyCalculator, name string, digest []byte) error {
+	h, err := policy.alg.Hash()
+	if err != nil {
+		return err
+	}
+	if len(digest) != h.Size() {
+		return fmt.Errorf("%s has size %d, want %d for %v", name, len(digest), h.Size(), policy.alg)
+	}
+	return nil
+}
 
 // CreatePrimary is the input to TPM2_CreatePrimary.
 // See definition in Part 3, Commands, section 24.1
