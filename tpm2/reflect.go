@@ -21,6 +21,25 @@ const (
 	maxListLength uint32 = 0x7FFF // 32767
 )
 
+// cleanupSessionsOnFailure flushes any just-in-time sessions created for a
+// command that failed before its response could be validated. Each session's
+// CleanupFailure is itself responsible for ignoring sessions it does not own
+// (user-managed, uninitialized, or already flushed), so this is safe to call
+// more than once and on partially initialized session sets. Any cleanup
+// errors are collected and joined onto the reported failure.
+func cleanupSessionsOnFailure(t transport.TPM, sess []Session) error {
+	var bonusErrs []string
+	for _, s := range sess {
+		if err := s.CleanupFailure(t); err != nil {
+			bonusErrs = append(bonusErrs, err.Error())
+		}
+	}
+	if len(bonusErrs) != 0 {
+		return fmt.Errorf("additional errors encountered during cleanup: %v", strings.Join(bonusErrs, ", "))
+	}
+	return nil
+}
+
 // execute sends the provided command and returns the TPM's response.
 func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Session) error {
 	cc := cmd.Command()
@@ -78,42 +97,64 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 	rspBuf := bytes.NewBuffer(response)
 	err = rspHeader(rspBuf)
 	if err != nil {
-		var bonusErrs []string
 		// Emergency cleanup, then return.
-		for _, s := range sess {
-			if err := s.CleanupFailure(t); err != nil {
-				bonusErrs = append(bonusErrs, err.Error())
-			}
-		}
-		if len(bonusErrs) != 0 {
-			return fmt.Errorf("%w - additional errors encountered during cleanup: %v", err, strings.Join(bonusErrs, ", "))
+		if cleanupErr := cleanupSessionsOnFailure(t, sess); cleanupErr != nil {
+			return fmt.Errorf("%w - %v", err, cleanupErr)
 		}
 		return err
 	}
 	err = rspHandles(rspBuf, rsp)
 	if err != nil {
+		if cleanupErr := cleanupSessionsOnFailure(t, sess); cleanupErr != nil {
+			return fmt.Errorf("%w - %v", err, cleanupErr)
+		}
 		return err
 	}
 	rspParms, err := rspParametersArea(hasSessions, rspBuf)
 	if err != nil {
+		if cleanupErr := cleanupSessionsOnFailure(t, sess); cleanupErr != nil {
+			return fmt.Errorf("%w - %v", err, cleanupErr)
+		}
 		return err
 	}
 	if hasSessions {
 		// We don't need the TPM RC here because we would have errored
 		// out from rspHeader
 		// TODO: Authenticate the error code with sessions, if desired.
+		var previousAuth []byte
+		authSnapshotTaken := false
 		if c, ok := any(cmd).(authChanger); ok {
-			if s, ok := sess[0].(authUpdater); ok {
-				s.updateAuth(c.newAuth())
+			if up, ok := sess[0].(authUpdater); ok {
+				// Snapshot the cached authorization value before this command
+				// changes it. The TPM only commits the new auth value when the
+				// command succeeds, so roll back to the snapshot if the
+				// response fails validation.
+				if r, ok := sess[0].(authReader); ok {
+					previousAuth = r.authValue()
+					authSnapshotTaken = true
+				}
+				up.updateAuth(c.newAuth())
 			}
 		}
 		err = rspSessions(rspBuf, TPMRCSuccess, cc, names, rspParms, sess)
 		if err != nil {
+			if authSnapshotTaken {
+				if up, ok := sess[0].(authUpdater); ok {
+					up.updateAuth(previousAuth)
+				}
+			}
+			// Emergency cleanup of any just-in-time sessions, then return.
+			if cleanupErr := cleanupSessionsOnFailure(t, sess); cleanupErr != nil {
+				return fmt.Errorf("%w - %v", err, cleanupErr)
+			}
 			return err
 		}
 	}
 	err = rspParameters(rspParms, sess, rsp)
 	if err != nil {
+		if cleanupErr := cleanupSessionsOnFailure(t, sess); cleanupErr != nil {
+			return fmt.Errorf("%w - %v", err, cleanupErr)
+		}
 		return err
 	}
 

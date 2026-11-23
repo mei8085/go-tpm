@@ -58,6 +58,15 @@ type authUpdater interface {
 	updateAuth(auth []byte)
 }
 
+// authReader is a session that caches the authorization value of the entity
+// it authorizes. It is used to snapshot the cached value before an
+// auth-changing command, so that it can be rolled back if the command's
+// response fails validation.
+type authReader interface {
+	// authValue returns a copy of the session's cached authorization value.
+	authValue() []byte
+}
+
 // CPHash calculates the TPM command parameter hash for a given Command.
 // N.B. Authorization sessions on handles are ignored, but names aren't.
 func CPHash[R any](alg TPMIAlgHash, cmd Command[R, *R]) (*TPM2BDigest, error) {
@@ -120,6 +129,9 @@ func (s *pwSession) Authorize(_ TPMCC, _, _ []byte, _ []TPM2BName, _ int) (*TPMS
 
 // Validates the response session structure for the session.
 func (s *pwSession) Validate(_ TPMRC, _ TPMCC, _ []byte, _ []TPM2BName, _ int, auth *TPMSAuthResponse) error {
+	if auth == nil {
+		return fmt.Errorf("nil response auth for password session")
+	}
 	if len(auth.Nonce.Buffer) != 0 {
 		return fmt.Errorf("expected empty nonce in response auth to PW session, got %x", auth.Nonce)
 	}
@@ -450,10 +462,18 @@ func (s *hmacSession) Init(t transport.TPM) error {
 	return nil
 }
 
-// Cleanup cleans up the session, if needed.
+// CleanupFailure cleans up the session, if needed.
+// It is safe to call more than once, or before the session was initialized:
+// a session that is user-managed, uninitialized, or already flushed is left
+// untouched.
 func (s *hmacSession) CleanupFailure(t transport.TPM) error {
 	// The user is already responsible to clean up this session.
 	if s.attrs.ContinueSession {
+		return nil
+	}
+	// Nothing to clean up if the session was never initialized, or if it was
+	// already flushed (e.g. by a previous cleanup, or by the TPM itself).
+	if s.handle == TPMRHNull {
 		return nil
 	}
 	fc := FlushContext{FlushHandle: s.handle}
@@ -575,14 +595,28 @@ func (s *hmacSession) updateAuth(auth []byte) {
 	s.auth = auth
 }
 
+// authValue implements the authReader interface. It returns a copy so that
+// later updates to the session's cached auth cannot mutate the snapshot.
+func (s *hmacSession) authValue() []byte {
+	return append([]byte(nil), s.auth...)
+}
+
 // Validate validates the response session structure for the session.
-// It updates nonceTPM from the TPM's response.
+// It only updates the session state (NonceTPM and handle) from the TPM's
+// response after every check has succeeded. If validation fails, the
+// session state is left untouched so that a later, independent use of the
+// same session is not polluted by an untrusted response.
 func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BName, authIndex int, auth *TPMSAuthResponse) error {
-	// Track the new nonceTPM for the session.
-	s.nonceTPM = auth.Nonce
+	if auth == nil {
+		return fmt.Errorf("nil response auth for HMAC session")
+	}
+	// Validate against the values carried in the response without committing
+	// them to the session state. The commit happens only once all checks pass.
+	newNonceTPM := auth.Nonce
+	newHandle := s.handle
 	// Track the session being automatically flushed.
 	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
+		newHandle = TPMRHNull
 	}
 
 	// Part 1, 19.6
@@ -599,7 +633,7 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 	if err != nil {
 		return err
 	}
-	mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+	mac, err := computeHMAC(s.hash, hmacKey, rph, newNonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 	if err != nil {
 		return err
 	}
@@ -607,6 +641,10 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 	if !hmac.Equal(mac, auth.Authorization.Buffer) {
 		return fmt.Errorf("incorrect authorization HMAC")
 	}
+
+	// Validation succeeded: commit the response-derived session state.
+	s.nonceTPM = newNonceTPM
+	s.handle = newHandle
 	return nil
 }
 
@@ -830,9 +868,17 @@ func (s *policySession) Init(t transport.TPM) error {
 }
 
 // CleanupFailure cleans up the session, if needed.
+// It is safe to call more than once, or before the session was initialized:
+// a session that is user-managed, uninitialized, or already flushed is left
+// untouched.
 func (s *policySession) CleanupFailure(t transport.TPM) error {
 	// The user is already responsible to clean up this session.
 	if s.attrs.ContinueSession {
+		return nil
+	}
+	// Nothing to clean up if the session was never initialized, or if it was
+	// already flushed (e.g. by a previous cleanup, or by the TPM itself).
+	if s.handle == TPMRHNull {
 		return nil
 	}
 	fc := FlushContext{FlushHandle: s.handle}
@@ -902,14 +948,28 @@ func (s *policySession) updateAuth(auth []byte) {
 	}
 }
 
-// Validate valitades the response session structure for the session.
-// Updates nonceTPM from the TPM's response.
+// authValue implements the authReader interface. It returns a copy so that
+// later updates to the session's cached auth cannot mutate the snapshot.
+func (s *policySession) authValue() []byte {
+	return append([]byte(nil), s.auth...)
+}
+
+// Validate validates the response session structure for the session.
+// It only updates the session state (NonceTPM and handle) from the TPM's
+// response after every check has succeeded. If validation fails, the
+// session state is left untouched so that a later, independent use of the
+// same session is not polluted by an untrusted response.
 func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName, _ int, auth *TPMSAuthResponse) error {
-	// Track the new nonceTPM for the session.
-	s.nonceTPM = auth.Nonce
+	if auth == nil {
+		return fmt.Errorf("nil response auth for policy session")
+	}
+	// Validate against the values carried in the response without committing
+	// them to the session state. The commit happens only once all checks pass.
+	newNonceTPM := auth.Nonce
+	newHandle := s.handle
 	// Track the session being automatically flushed.
 	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
+		newHandle = TPMRHNull
 	}
 
 	if s.password {
@@ -931,7 +991,7 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 		if err != nil {
 			return err
 		}
-		mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+		mac, err := computeHMAC(s.hash, hmacKey, rph, newNonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 		if err != nil {
 			return err
 		}
@@ -940,6 +1000,10 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 			return fmt.Errorf("incorrect authorization HMAC")
 		}
 	}
+
+	// Validation succeeded: commit the response-derived session state.
+	s.nonceTPM = newNonceTPM
+	s.handle = newHandle
 	return nil
 }
 
